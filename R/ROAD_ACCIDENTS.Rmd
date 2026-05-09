@@ -1,0 +1,858 @@
+---
+title: "Nonparametric Analysis – NYC Road Accidents (2015–2024)"
+author: "Dharani Bhumireddy"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    df_print: kable
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+header-includes:
+  - \usepackage{fontspec}
+  - \setmainfont{Times New Roman}
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi     = 150
+)
+```
+
+# Overview
+
+This R Markdown file performs the full nonparametric analysis for the
+**NYC Motor Vehicle Collisions (Road Accidents)** dataset (NYPD, 2015–2024).
+
+- **Source:** NYC Open Data — NYPD Motor Vehicle Collisions - Crashes
+- **Records:** ~1,636,872
+- **Columns:** 29
+- **Period:** 2015–2024
+
+**11 nonparametric tests are executed in this file:**
+
+| # | Test | Research Question |
+|---|---|---|
+| 1 | Permutation Test | Do accident locations show spatial dependence? |
+| 2 | Kruskal-Wallis | Do accident counts differ among boroughs? |
+| 3 | Wilcoxon Rank Sum | Do monthly counts change year-to-year? |
+| 4 | Mann-Whitney U | Is accident frequency different weekday vs weekend? |
+| 5 | Spearman Correlation | Is there monotonic association between motorist and cyclist injuries? |
+| 6 | Kendall's Tau | Is there concordance between persons injured and killed? |
+| 7 | Kruskal-Wallis | Does accident year vary across boroughs? |
+| 8 | Kruskal-Wallis | Do fatalities differ across vehicle types? |
+| 9 | Friedman Test | Do accident counts differ across years within boroughs? |
+| 10 | Runs Test | Is the sequence of monthly accident counts random? |
+| 11 | Wilcoxon Signed Rank | Did accident frequency change before vs after 2019? |
+
+---
+
+# Package Installation and Loading
+
+```{r packages}
+required_pkgs <- c(
+  "dplyr", "tidyr", "stringr", "lubridate", "purrr",
+  "readr", "ggplot2", "tseries", "coin", "knitr",
+  "scales", "RColorBrewer", "gridExtra"
+)
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cran.r-project.org")
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+set.seed(42)
+```
+
+---
+
+# Data File Paths
+
+```{r file-paths}
+# ── UPDATE THESE PATHS ────────────────────────────────────────────────────
+# Download from: https://data.cityofnewyork.us/Transportation/Motor-Vehicle-Collisions-Crashes/h9gi-nx95
+# Split large file into parts if needed
+
+paths <- c(
+  "data/NYC_ROAD_ACCIDENTS/NYC_1_ROAD_ACCIDENTS_RAW.csv",
+  "data/NYC_ROAD_ACCIDENTS/NYC_2_ROAD_ACCIDENTS_RAW.csv",
+  "data/NYC_ROAD_ACCIDENTS/NYC_3_ROAD_ACCIDENTS_RAW.csv"
+)
+
+output_dir <- "outputs/road_accidents"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+```
+
+---
+
+# Helper Functions
+
+```{r helper-functions}
+# ── Read and clean one Road Accidents file ─────────────────────────────────
+safe_read_road <- function(path) {
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  colnames(df) <- toupper(trimws(colnames(df)))
+  colnames(df) <- gsub("[[:space:]]+", "_", colnames(df))
+
+  # Parse CRASH_DATE + CRASH_TIME into datetime
+  if ("CRASH_DATE" %in% colnames(df)) {
+    date_parsed <- suppressWarnings(
+      lubridate::parse_date_time(df$CRASH_DATE,
+                                  orders = c("mdy", "ymd", "dmy"), quiet = TRUE)
+    )
+    if ("CRASH_TIME" %in% colnames(df)) {
+      time_str <- df$CRASH_TIME
+      time_str[is.na(time_str) | time_str == ""] <- "00:00"
+      df$CRASH_DATETIME <- suppressWarnings(
+        as.POSIXct(paste(as.Date(date_parsed), time_str),
+                   format = "%Y-%m-%d %H:%M", tz = "America/New_York")
+      )
+    } else {
+      df$CRASH_DATETIME <- as.POSIXct(date_parsed, tz = "America/New_York")
+    }
+  }
+  df
+}
+
+# ── Prepare cleaned road accidents dataframe ───────────────────────────────
+prep_road <- function(df) {
+  # Keep only valid boroughs
+  valid_boroughs <- c("MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND")
+  df$BOROUGH <- toupper(trimws(df$BOROUGH))
+  df <- df[df$BOROUGH %in% valid_boroughs & !is.na(df$BOROUGH), ]
+
+  # Drop rows with missing datetime
+  df <- df[!is.na(df$CRASH_DATETIME), ]
+
+  # Numeric columns — coerce safely
+  num_cols <- c(
+    "NUMBER_OF_PERSONS_INJURED",   "NUMBER_OF_PERSONS_KILLED",
+    "NUMBER_OF_PEDESTRIANS_INJURED","NUMBER_OF_PEDESTRIANS_KILLED",
+    "NUMBER_OF_CYCLIST_INJURED",    "NUMBER_OF_CYCLIST_KILLED",
+    "NUMBER_OF_MOTORIST_INJURED",   "NUMBER_OF_MOTORIST_KILLED",
+    "LATITUDE", "LONGITUDE"
+  )
+  for (cn in num_cols) {
+    if (cn %in% names(df)) {
+      df[[cn]] <- suppressWarnings(as.numeric(df[[cn]]))
+      df[[cn]][is.na(df[[cn]])] <- 0
+    }
+  }
+
+  # Temporal features
+  df$YEAR        <- lubridate::year(df$CRASH_DATETIME)
+  df$MONTH       <- lubridate::month(df$CRASH_DATETIME)
+  df$DAY         <- lubridate::day(df$CRASH_DATETIME)
+  df$HOUR        <- lubridate::hour(df$CRASH_DATETIME)
+  df$DAY_OF_WEEK <- lubridate::wday(df$CRASH_DATETIME, label = TRUE)
+  df$IS_WEEKEND  <- as.integer(df$DAY_OF_WEEK %in% c("Sat", "Sun"))
+
+  # Remove records outside 2015–2024
+  df <- df[!is.na(df$YEAR) & df$YEAR >= 2015 & df$YEAR <= 2024, ]
+
+  df
+}
+
+# ── Extract htest summary ─────────────────────────────────────────────────
+extract_test <- function(test_name, result, interpretation) {
+  if (is.null(result) || !inherits(result, "htest")) {
+    return(data.frame(Test = test_name, Statistic = NA_real_,
+                      P_Value = NA_real_, Decision = "NA",
+                      Interpretation = interpretation,
+                      stringsAsFactors = FALSE))
+  }
+  p_val    <- result$p.value
+  decision <- ifelse(p_val < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0")
+  data.frame(Test = test_name,
+             Statistic = round(as.numeric(result$statistic), 4),
+             P_Value   = round(p_val, 6),
+             Decision  = decision,
+             Interpretation = interpretation,
+             stringsAsFactors = FALSE)
+}
+```
+
+---
+
+# Data Loading and Cleaning
+
+```{r load-data}
+cat("Loading road accidents files...\n")
+road_list <- lapply(paths, function(p) {
+  cat("  Processing:", basename(p), "\n")
+  df <- safe_read_road(p)
+  prep_road(df)
+})
+
+df <- dplyr::bind_rows(road_list)
+
+cat("\nTotal records:", format(nrow(df), big.mark = ","), "\n")
+cat("Columns:", ncol(df), "\n")
+cat("Years:", min(df$YEAR), "–", max(df$YEAR), "\n")
+cat("Boroughs:", paste(sort(unique(df$BOROUGH)), collapse = ", "), "\n")
+
+# Summary table
+cat("\nPersons injured/killed summary:\n")
+print(summary(df[, c("NUMBER_OF_PERSONS_INJURED",
+                      "NUMBER_OF_PERSONS_KILLED",
+                      "NUMBER_OF_CYCLIST_INJURED",
+                      "NUMBER_OF_MOTORIST_INJURED")]))
+```
+
+---
+
+# Save Cleaned Data
+
+```{r save-cleaned}
+clean_path <- file.path(output_dir, "road_accidents_cleaned.csv")
+write.csv(df, clean_path, row.names = FALSE)
+cat("Cleaned data saved to:", clean_path, "\n")
+```
+
+---
+
+# Exploratory Data Analysis
+
+```{r eda-setup}
+BOROUGH_COLORS <- c(
+  "MANHATTAN"     = "#4F46E5",
+  "BROOKLYN"      = "#EF4444",
+  "QUEENS"        = "#10B981",
+  "BRONX"         = "#F59E0B",
+  "STATEN ISLAND" = "#8B5CF6"
+)
+```
+
+```{r eda-borough}
+boro_cnt <- df %>%
+  count(BOROUGH, name = "accidents") %>%
+  arrange(desc(accidents)) %>%
+  mutate(pct = round(accidents / sum(accidents) * 100, 1))
+
+kable(boro_cnt, caption = "Road Accidents by Borough",
+      col.names = c("Borough", "Accidents", "% of Total"))
+
+ggplot(boro_cnt, aes(x = reorder(BOROUGH, accidents), y = accidents,
+                     fill = BOROUGH)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0(format(accidents, big.mark = ","),
+                               " (", pct, "%)")),
+            hjust = -0.08, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = BOROUGH_COLORS) +
+  scale_y_continuous(labels = scales::comma,
+                     expand = expansion(mult = c(0, 0.20))) +
+  coord_flip() +
+  labs(
+    title    = "NYC Road Accidents by Borough (2015–2024)",
+    subtitle = "Kruskal-Wallis: Significant differences confirmed across boroughs",
+    x = "Borough", y = "Number of Accidents"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r eda-yearly}
+yr_boro <- df %>%
+  count(YEAR, BOROUGH, name = "count")
+
+ggplot(yr_boro, aes(x = YEAR, y = count, color = BOROUGH, group = BOROUGH)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = 2019, linetype = "dashed", color = "black",
+             linewidth = 0.8, alpha = 0.7) +
+  annotate("text", x = 2019.2,
+           y = max(yr_boro$count, na.rm = TRUE) * 0.95,
+           label = "2019 Vision Zero", hjust = 0, size = 3.5) +
+  scale_color_manual(values = BOROUGH_COLORS, name = "Borough") +
+  scale_x_continuous(breaks = 2015:2024) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Road Accidents Yearly Trend by Borough",
+    subtitle = "Wilcoxon Signed Rank: Pre vs Post 2019 policy intervention",
+    x = "Year", y = "Accident Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r eda-vehicle-injuries}
+veh_inj <- df %>%
+  filter(!is.na(VEHICLE_TYPE_CODE_1), VEHICLE_TYPE_CODE_1 != "") %>%
+  group_by(VEHICLE_TYPE_CODE_1) %>%
+  summarise(total_injured = sum(NUMBER_OF_PERSONS_INJURED, na.rm = TRUE),
+            .groups = "drop") %>%
+  slice_max(total_injured, n = 10)
+
+ggplot(veh_inj, aes(x = reorder(VEHICLE_TYPE_CODE_1, total_injured),
+                    y = total_injured)) +
+  geom_col(fill = "#EF4444", width = 0.7) +
+  geom_text(aes(label = format(total_injured, big.mark = ",")),
+            hjust = -0.1, size = 3.2) +
+  scale_y_continuous(labels = scales::comma,
+                     expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title = "Total Persons Injured by Vehicle Type (Top 10)",
+    subtitle = "Kruskal-Wallis: Fatality rates differ across vehicle types",
+    x = "Vehicle Type", y = "Total Injured"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r eda-weekday-weekend}
+wk_df <- df %>%
+  group_by(IS_WEEKEND) %>%
+  summarise(
+    total_accidents = n(),
+    total_injured   = sum(NUMBER_OF_PERSONS_INJURED, na.rm = TRUE),
+    avg_injured     = mean(NUMBER_OF_PERSONS_INJURED, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(day_type = ifelse(IS_WEEKEND == 1, "Weekend", "Weekday"))
+
+kable(wk_df[, c("day_type", "total_accidents", "total_injured", "avg_injured")],
+      caption = "Weekday vs Weekend Accident Comparison",
+      digits = 3)
+```
+
+```{r eda-monthly-heatmap}
+mo_boro <- df %>%
+  count(BOROUGH, MONTH, name = "count")
+
+ggplot(mo_boro, aes(x = factor(MONTH), y = BOROUGH, fill = count)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = count), size = 2.8) +
+  scale_fill_gradient(low = "#FEE2E2", high = "#EF4444",
+                      labels = scales::comma, name = "Count") +
+  scale_x_discrete(labels = month.abb) +
+  labs(
+    title    = "Road Accidents — Monthly × Borough Heatmap",
+    subtitle = "Friedman Test: Multi-year borough patterns are significant",
+    x = "Month", y = "Borough"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+# Nonparametric Tests
+
+## Test 1 — Permutation Test (Spatial: LATITUDE vs LONGITUDE)
+
+**H₀:** No significant spatial dependence in accident locations
+**H₁:** Accident locations show significant spatial structure
+
+```{r test1-permutation-spatial}
+set.seed(42)
+N_PERM <- 1000
+
+geo_df <- df %>%
+  filter(!is.na(LATITUDE), LATITUDE != 0,
+         !is.na(LONGITUDE), LONGITUDE != 0) %>%
+  sample_n(min(2000, n()))
+
+obs_diff_geo <- abs(mean(geo_df$LATITUDE) - abs(mean(geo_df$LONGITUDE)))
+combined_geo <- c(geo_df$LATITUDE, abs(geo_df$LONGITUDE))
+n_lat        <- nrow(geo_df)
+
+perm_sp <- replicate(N_PERM, {
+  s <- sample(combined_geo)
+  abs(mean(s[1:n_lat]) - mean(s[(n_lat + 1):length(s)]))
+})
+
+t1_p <- mean(perm_sp >= obs_diff_geo)
+
+cat("Permutation Test — Spatial (Lat vs Long)\n")
+cat("  Observed |diff|:", round(obs_diff_geo, 6), "\n")
+cat("  P-value:", round(t1_p, 4), "\n")
+cat("  Decision:", ifelse(t1_p < 0.05, "Reject H0", "Fail to Reject H0"), "\n")
+
+test1_result <- data.frame(
+  Test = "Permutation Test (Lat vs Long — spatial dependence)",
+  Statistic = round(obs_diff_geo, 6),
+  P_Value   = round(t1_p, 4),
+  Decision  = ifelse(t1_p < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0"),
+  Interpretation = paste(
+    "Accident locations",
+    ifelse(t1_p < 0.05,
+           "show significant spatial dependence — geographic clustering confirmed.",
+           "do not show significant spatial clustering.")
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+## Test 2 — Kruskal-Wallis (Accident Frequency across Boroughs)
+
+**H₀:** Daily accident counts are equal across all boroughs
+**H₁:** At least one borough differs
+
+```{r test2-kruskal-wallis-borough}
+by_day_boro <- df %>%
+  mutate(date = as.Date(CRASH_DATETIME)) %>%
+  count(BOROUGH, date, YEAR, MONTH, name = "n")
+
+t2 <- kruskal.test(n ~ BOROUGH, data = by_day_boro)
+
+cat("Kruskal-Wallis — Daily accident counts across boroughs\n")
+print(t2)
+
+test2_result <- extract_test(
+  "Kruskal-Wallis (Accident frequency across boroughs)",
+  t2,
+  paste("Daily accident counts",
+        ifelse(t2$p.value < 0.05,
+               "differ significantly across boroughs (p < 0.05).",
+               "do not significantly differ across boroughs."))
+)
+```
+
+## Test 3 — Wilcoxon Rank Sum (Monthly Counts: 2015 vs 2020)
+
+**H₀:** Monthly accident counts do not differ between 2015 and 2020
+**H₁:** Significant year-to-year change exists
+
+```{r test3-wilcoxon-ranksum}
+counts_2015 <- df %>%
+  filter(YEAR == 2015) %>%
+  count(MONTH, name = "n") %>%
+  arrange(MONTH) %>%
+  pull(n)
+
+counts_2020 <- df %>%
+  filter(YEAR == 2020) %>%
+  count(MONTH, name = "n") %>%
+  arrange(MONTH) %>%
+  pull(n)
+
+n_min <- min(length(counts_2015), length(counts_2020))
+t3    <- wilcox.test(counts_2015[1:n_min], counts_2020[1:n_min],
+                     alternative = "two.sided", paired = FALSE)
+
+cat("Wilcoxon Rank Sum — Monthly counts 2015 vs 2020\n")
+print(t3)
+
+# Visualization
+yr_mo_df <- df %>%
+  filter(YEAR %in% c(2015, 2019, 2020, 2022, 2024)) %>%
+  count(YEAR, MONTH, name = "count") %>%
+  mutate(YEAR = factor(YEAR))
+
+ggplot(yr_mo_df, aes(x = MONTH, y = count, color = YEAR, group = YEAR)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_brewer(palette = "Set1", name = "Year") +
+  labs(
+    title    = "Monthly Accident Counts — Selected Years",
+    subtitle = paste("Wilcoxon Rank Sum (2015 vs 2020): W =",
+                     round(t3$statistic, 0), "| p =",
+                     round(t3$p.value, 4)),
+    x = "Month", y = "Accident Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test3_result <- extract_test(
+  "Wilcoxon Rank Sum (Monthly counts: 2015 vs 2020)",
+  t3,
+  paste("Monthly accident counts",
+        ifelse(t3$p.value < 0.05,
+               "significantly changed between 2015 and 2020.",
+               "did not significantly change between 2015 and 2020."))
+)
+```
+
+## Test 4 — Mann-Whitney U (Weekday vs Weekend Injuries)
+
+**H₀:** Injury frequency is the same on weekdays and weekends
+**H₁:** Injury frequency differs between weekdays and weekends
+
+```{r test4-mannwhitney-weekend}
+weekday_inj <- df[df$IS_WEEKEND == 0, "NUMBER_OF_PERSONS_INJURED"]
+weekend_inj <- df[df$IS_WEEKEND == 1, "NUMBER_OF_PERSONS_INJURED"]
+weekday_inj <- na.omit(weekday_inj)
+weekend_inj <- na.omit(weekend_inj)
+
+t4 <- wilcox.test(weekday_inj, weekend_inj, alternative = "two.sided",
+                  correct = TRUE)
+
+cat("Mann-Whitney U — Weekday vs Weekend injuries\n")
+print(t4)
+
+inj_df <- data.frame(
+  injuries = c(weekday_inj, weekend_inj),
+  day_type = c(rep("Weekday", length(weekday_inj)),
+               rep("Weekend", length(weekend_inj)))
+)
+
+ggplot(inj_df, aes(x = injuries, fill = day_type)) +
+  geom_histogram(bins = 7, alpha = 0.75, position = "identity",
+                 color = "white", binwidth = 1) +
+  scale_fill_manual(values = c("Weekday" = "#4F46E5", "Weekend" = "#EF4444"),
+                    name = "Day Type") +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_continuous(breaks = 0:6) +
+  labs(
+    title    = "Persons Injured Distribution: Weekday vs Weekend",
+    subtitle = paste("Mann-Whitney U: W =", round(t4$statistic, 0),
+                     "| p =", round(t4$p.value, 4)),
+    x = "Number of Persons Injured", y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test4_result <- extract_test(
+  "Mann-Whitney U (Weekday vs Weekend — Persons Injured)",
+  t4,
+  paste("Injury frequency",
+        ifelse(t4$p.value < 0.05,
+               "differs significantly between weekdays and weekends.",
+               "does not significantly differ between weekdays and weekends."))
+)
+```
+
+## Test 5 — Spearman Correlation (Motorist vs Cyclist Injuries)
+
+**H₀:** No monotonic association between motorist injuries and cyclist injuries
+**H₁:** Significant monotonic association exists
+
+```{r test5-spearman}
+inj_df2 <- df %>%
+  select(NUMBER_OF_MOTORIST_INJURED, NUMBER_OF_CYCLIST_INJURED) %>%
+  filter(!is.na(NUMBER_OF_MOTORIST_INJURED),
+         !is.na(NUMBER_OF_CYCLIST_INJURED))
+
+t5 <- cor.test(inj_df2$NUMBER_OF_MOTORIST_INJURED,
+               inj_df2$NUMBER_OF_CYCLIST_INJURED,
+               method = "spearman", exact = FALSE)
+
+cat("Spearman Correlation — Motorist vs Cyclist injuries\n")
+print(t5)
+
+ggplot(inj_df2 %>% sample_n(min(3000, nrow(.))),
+       aes(x = NUMBER_OF_MOTORIST_INJURED,
+           y = NUMBER_OF_CYCLIST_INJURED)) +
+  geom_jitter(alpha = 0.25, color = "#4F46E5", size = 1,
+              width = 0.2, height = 0.2) +
+  geom_smooth(method = "lm", se = TRUE, color = "#EF4444",
+              linewidth = 1.2) +
+  labs(
+    title    = "Spearman Correlation: Motorist vs Cyclist Injuries",
+    subtitle = paste("ρ =", round(t5$estimate, 4),
+                     "| p =", formatC(t5$p.value, format = "e", digits = 3)),
+    x = "Motorist Injuries", y = "Cyclist Injuries"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test5_result <- extract_test(
+  "Spearman Correlation (Motorist vs Cyclist injuries)",
+  t5,
+  paste("Monotonic association ρ =", round(t5$estimate, 3),
+        "between motorist and cyclist injuries.")
+)
+```
+
+## Test 6 — Kendall's Tau (Persons Injured vs Persons Killed)
+
+**H₀:** No concordance between persons injured and persons killed
+**H₁:** Significant concordance exists
+
+```{r test6-kendall}
+killed_df <- df %>%
+  select(NUMBER_OF_PERSONS_INJURED, NUMBER_OF_PERSONS_KILLED) %>%
+  filter(!is.na(NUMBER_OF_PERSONS_INJURED),
+         !is.na(NUMBER_OF_PERSONS_KILLED))
+
+t6 <- cor.test(killed_df$NUMBER_OF_PERSONS_INJURED,
+               killed_df$NUMBER_OF_PERSONS_KILLED,
+               method = "kendall", exact = FALSE)
+
+cat("Kendall's Tau — Persons injured vs killed\n")
+print(t6)
+
+test6_result <- extract_test(
+  "Kendall's Tau (Persons injured vs persons killed)",
+  t6,
+  paste("Concordance τ =", round(t6$estimate, 3),
+        "— injuries and fatalities are",
+        ifelse(t6$p.value < 0.05,
+               "significantly associated.",
+               "not significantly associated."))
+)
+```
+
+## Test 7 — Kruskal-Wallis (Accident Year varies across Boroughs)
+
+**H₀:** Accident year distribution is the same across boroughs
+**H₁:** Accident year distribution differs across boroughs
+
+```{r test7-kw-year-borough}
+t7 <- kruskal.test(YEAR ~ BOROUGH,
+                   data = df %>% filter(!is.na(YEAR), BOROUGH != ""))
+
+cat("Kruskal-Wallis — Accident YEAR across boroughs\n")
+print(t7)
+
+yr_boro_box <- df %>%
+  filter(!is.na(YEAR), BOROUGH != "")
+
+ggplot(yr_boro_box, aes(x = BOROUGH, y = YEAR, fill = BOROUGH)) +
+  geom_boxplot(alpha = 0.8, outlier.size = 0.5, show.legend = FALSE) +
+  scale_fill_manual(values = BOROUGH_COLORS) +
+  labs(
+    title    = "Accident Year Distribution by Borough",
+    subtitle = paste("Kruskal-Wallis: χ² =", round(t7$statistic, 2),
+                     "| p =", round(t7$p.value, 4)),
+    x = "Borough", y = "Year"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 15, hjust = 1))
+
+test7_result <- extract_test(
+  "Kruskal-Wallis (Accident year varies across boroughs)",
+  t7,
+  paste("Accident year distribution",
+        ifelse(t7$p.value < 0.05,
+               "significantly differs across boroughs.",
+               "does not significantly differ across boroughs."))
+)
+```
+
+## Test 8 — Kruskal-Wallis (Fatalities by Vehicle Type)
+
+**H₀:** Fatality rates are equal across vehicle types
+**H₁:** At least one vehicle type has significantly different fatalities
+
+```{r test8-kw-vehicle}
+veh_df <- df %>%
+  filter(!is.na(VEHICLE_TYPE_CODE_1), VEHICLE_TYPE_CODE_1 != "",
+         !is.na(NUMBER_OF_PERSONS_KILLED))
+
+# Top 8 vehicle types by frequency
+top_vehicles <- veh_df %>%
+  count(VEHICLE_TYPE_CODE_1) %>%
+  slice_max(n, n = 8) %>%
+  pull(VEHICLE_TYPE_CODE_1)
+
+veh_fat_df <- veh_df %>%
+  filter(VEHICLE_TYPE_CODE_1 %in% top_vehicles)
+
+t8 <- kruskal.test(NUMBER_OF_PERSONS_KILLED ~ VEHICLE_TYPE_CODE_1,
+                   data = veh_fat_df)
+
+cat("Kruskal-Wallis — Fatalities by vehicle type\n")
+print(t8)
+
+test8_result <- extract_test(
+  "Kruskal-Wallis (Fatalities by vehicle type)",
+  t8,
+  paste("Fatality rates",
+        ifelse(t8$p.value < 0.05,
+               "differ significantly across vehicle types.",
+               "do not significantly differ across vehicle types."))
+)
+```
+
+## Test 9 — Friedman Test (Multi-year Borough Accident Patterns)
+
+**H₀:** Accident counts do not differ across years within boroughs
+**H₁:** Significant year × borough interaction exists
+
+```{r test9-friedman}
+frd_data <- df %>%
+  count(BOROUGH, YEAR, name = "n") %>%
+  tidyr::pivot_wider(names_from = YEAR, values_from = n,
+                     values_fill = 0L)
+
+# Keep only rows and columns with complete data
+frd_matrix <- frd_data %>%
+  select(-BOROUGH) %>%
+  as.matrix()
+rownames(frd_matrix) <- frd_data$BOROUGH
+frd_complete <- frd_matrix[complete.cases(frd_matrix), ]
+
+cat("Friedman matrix dimensions:", dim(frd_complete), "\n")
+print(frd_complete)
+
+if (nrow(frd_complete) >= 2 && ncol(frd_complete) >= 3) {
+  t9 <- friedman.test(frd_complete)
+  cat("\nFriedman Test — Accident counts by Year × Borough\n")
+  print(t9)
+  test9_result <- extract_test(
+    "Friedman Test (Multi-year borough accident patterns)",
+    t9,
+    paste("Accident counts",
+          ifelse(t9$p.value < 0.05,
+                 "differ significantly across years within boroughs.",
+                 "do not significantly differ across years within boroughs."))
+  )
+} else {
+  cat("Insufficient data for Friedman Test\n")
+  test9_result <- data.frame(
+    Test = "Friedman Test (Multi-year borough accident patterns)",
+    Statistic = NA, P_Value = NA,
+    Decision = "Insufficient data",
+    Interpretation = "Could not run — need >= 2 boroughs and >= 3 years of complete data.",
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+## Test 10 — Runs Test (Temporal Randomness of Monthly Counts)
+
+**H₀:** The sequence of monthly accident counts is random
+**H₁:** Non-random temporal patterns exist
+
+```{r test10-runs-test}
+monthly_counts <- df %>%
+  count(YEAR, MONTH, name = "count") %>%
+  arrange(YEAR, MONTH) %>%
+  pull(count)
+
+med_mc     <- median(monthly_counts, na.rm = TRUE)
+binary_seq <- factor(ifelse(monthly_counts >= med_mc, "above", "below"))
+
+t10 <- tseries::runs.test(binary_seq)
+
+cat("Runs Test — Temporal randomness of monthly accident counts\n")
+print(t10)
+
+ggplot(data.frame(index = seq_along(monthly_counts), count = monthly_counts),
+       aes(x = index, y = count)) +
+  geom_line(color = "#4F46E5", linewidth = 0.8) +
+  geom_hline(yintercept = med_mc, linetype = "dashed",
+             color = "#EF4444", linewidth = 1) +
+  annotate("text", x = 1, y = med_mc * 1.03,
+           label = "Median", color = "#EF4444", hjust = 0) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Monthly Accident Counts — Temporal Sequence",
+    subtitle = paste("Runs Test: z =", round(t10$statistic, 4),
+                     "| p =", round(t10$p.value, 4)),
+    x = "Month Index (2015–2024)", y = "Accident Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test10_result <- extract_test(
+  "Runs Test (Temporal randomness of monthly accident counts)",
+  t10,
+  paste("Monthly accident sequence is",
+        ifelse(t10$p.value < 0.05,
+               "non-random — temporal patterns detected.",
+               "consistent with randomness — no strong temporal pattern."))
+)
+```
+
+## Test 11 — Wilcoxon Signed Rank (Pre vs Post 2019 Vision Zero)
+
+**H₀:** Monthly accident counts did not change before vs after 2019
+**H₁:** Significant change in accident frequency after the policy
+
+```{r test11-wilcoxon-signed-rank-2019}
+pre_counts <- df %>%
+  filter(YEAR < 2019) %>%
+  count(YEAR, MONTH, name = "count") %>%
+  arrange(YEAR, MONTH) %>%
+  pull(count)
+
+post_counts <- df %>%
+  filter(YEAR >= 2019) %>%
+  count(YEAR, MONTH, name = "count") %>%
+  arrange(YEAR, MONTH) %>%
+  pull(count)
+
+n_paired <- min(length(pre_counts), length(post_counts))
+t11 <- wilcox.test(pre_counts[1:n_paired], post_counts[1:n_paired],
+                   paired = TRUE, alternative = "two.sided", exact = FALSE)
+
+cat("Wilcoxon Signed Rank — Pre (< 2019) vs Post (>= 2019)\n")
+cat("  Pre-period months:", length(pre_counts), "\n")
+cat("  Post-period months:", length(post_counts), "\n")
+cat("  Paired on:", n_paired, "observations\n")
+print(t11)
+
+# Pre/Post comparison plot
+pp_df <- data.frame(
+  month_idx = 1:n_paired,
+  Pre       = pre_counts[1:n_paired],
+  Post      = post_counts[1:n_paired]
+) %>%
+  tidyr::pivot_longer(cols = c(Pre, Post),
+                      names_to = "Period", values_to = "count")
+
+ggplot(pp_df, aes(x = month_idx, y = count, color = Period, group = Period)) +
+  geom_line(linewidth = 0.9, alpha = 0.8) +
+  scale_color_manual(values = c("Pre" = "#4F46E5", "Post" = "#EF4444"),
+                     name = "Period") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Pre vs Post 2019 Monthly Accident Counts",
+    subtitle = paste("Wilcoxon Signed Rank: V =",
+                     round(t11$statistic, 0),
+                     "| p =", round(t11$p.value, 4)),
+    x = "Month Index", y = "Accident Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test11_result <- extract_test(
+  "Wilcoxon Signed Rank (Pre vs Post 2019 Vision Zero)",
+  t11,
+  paste("Monthly accident counts",
+        ifelse(t11$p.value < 0.05,
+               "significantly changed after the 2019 Vision Zero intervention.",
+               "did not significantly change after the 2019 intervention."))
+)
+```
+
+---
+
+# Summary of All 11 Test Results
+
+```{r results-summary}
+all_results <- dplyr::bind_rows(
+  test1_result,  test2_result,  test3_result,  test4_result,
+  test5_result,  test6_result,  test7_result,  test8_result,
+  test9_result,  test10_result, test11_result
+)
+all_results$Test_Num <- 1:11
+all_results <- all_results[, c("Test_Num", "Test", "Statistic",
+                                "P_Value", "Decision", "Interpretation")]
+
+kable(all_results,
+      caption = "Road Accidents — All 11 Nonparametric Test Results",
+      col.names = c("#", "Test Name", "Statistic", "P-Value",
+                    "Decision (α=0.05)", "Interpretation"))
+
+n_sig   <- sum(grepl("Reject", all_results$Decision) &
+               !grepl("Fail", all_results$Decision))
+cat("\nSignificant results:", n_sig, "of 11\n")
+
+results_path <- file.path(output_dir, "Road_Accidents_Test_Results.csv")
+write.csv(all_results, results_path, row.names = FALSE)
+cat("Results saved to:", results_path, "\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

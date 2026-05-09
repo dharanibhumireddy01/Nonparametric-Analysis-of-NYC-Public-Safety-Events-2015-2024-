@@ -1,0 +1,979 @@
+---
+title: "Nonparametric Analysis – NYC Assaults & Thefts (2015–2024)"
+author: "Dharani Bhumireddy"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 3
+    df_print: kable
+    number_sections: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+header-includes:
+  - \usepackage{fontspec}
+  - \setmainfont{Times New Roman}
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi     = 150
+)
+```
+
+# Overview
+
+This R Markdown file performs the full nonparametric analysis for the
+**NYC Assaults & Thefts** dataset (NYPD Complaint Data Historic, 2015–2024).
+
+- **Source:** NYC Open Data — NYPD Complaint Data Historic
+- **Records:** ~4,861,139
+- **Columns:** 35
+- **Period:** 2015–2024
+
+**12 nonparametric tests are executed in this file:**
+
+| # | Test | Research Question |
+|---|---|---|
+| 1 | Sign Test | Do numeric medians differ from reference values? |
+| 2 | Wilcoxon Signed Rank (1-sample) | Do crime variables differ from hypothesized medians? |
+| 3 | Mann-Whitney U | Does ADDR_PCT_CD differ between two boroughs? |
+| 4 | Kruskal-Wallis | Does ADDR_PCT_CD differ across all 5 boroughs? |
+| 5 | Kolmogorov-Smirnov | Do distributions differ between borough pairs? |
+| 6 | Spearman Correlation | Is there monotonic association between ADDR_PCT_CD and KY_CD? |
+| 7 | Spearman Correlation Matrix | Do age group variables show rank associations? |
+| 8 | Permutation Test | Is the difference in mean KY_CD between boroughs significant? |
+| 9 | Sign + Wilcoxon + KW | Do suspect and victim age groups differ? |
+| 10 | Mann-Whitney + KW + KS | Are crime indicators distributed differently? |
+| 11 | Spearman + KS | Do borough codes associate with offense severity? |
+| 12 | Permutation Test (resampling) | Are offense-code medians higher in Manhattan vs Brooklyn? |
+
+---
+
+# Package Installation and Loading
+
+```{r packages}
+required_pkgs <- c(
+  "dplyr", "tidyr", "stringr", "lubridate", "purrr",
+  "readr", "ggplot2", "tseries", "coin", "knitr",
+  "scales", "RColorBrewer", "gridExtra"
+)
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cran.r-project.org")
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+set.seed(42)  # reproducibility for permutation tests
+```
+
+---
+
+# Data File Paths
+
+```{r file-paths}
+# ── UPDATE THESE PATHS to point to your downloaded NYC Open Data CSV files ──
+# The raw data files should be split parts of the NYPD Complaint Data Historic
+# downloaded from: https://data.cityofnewyork.us/Public-Safety/NYPD-Complaint-Data-Historic/qgea-i56i
+
+paths <- c(
+  "data/NYC_ASSAULTS_THEFTS/NYC_1_ASSAULTS_THEFTS_RAW.csv",
+  "data/NYC_ASSAULTS_THEFTS/NYC_2_ASSAULTS_THEFTS_RAW.csv",
+  "data/NYC_ASSAULTS_THEFTS/NYC_3_ASSAULTS_THEFTS_RAW.csv",
+  "data/NYC_ASSAULTS_THEFTS/NYC_4_ASSAULTS_THEFTS_RAW.csv",
+  "data/NYC_ASSAULTS_THEFTS/NYC_5_ASSAULTS_THEFTS_RAW.csv"
+)
+
+# Output directory for cleaned data and results
+output_dir <- "outputs/assaults_thefts"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+```
+
+---
+
+# Helper Functions
+
+```{r helper-functions}
+# ── Robust datetime parser ─────────────────────────────────────────────────
+safe_parse_datetime <- function(date_vec, time_vec = NULL) {
+  parsed_dates <- lubridate::parse_date_time(
+    date_vec,
+    orders = c("mdy", "ymd", "dmy"),
+    exact  = FALSE,
+    quiet  = TRUE
+  )
+  if (is.null(time_vec)) {
+    return(as.POSIXct(parsed_dates, tz = "America/New_York"))
+  }
+  time_vec[is.na(time_vec) | time_vec == ""] <- "00:00:00"
+  time_vec <- ifelse(
+    nchar(time_vec) < 8,
+    stringr::str_pad(time_vec, 8, side = "right", pad = "0"),
+    time_vec
+  )
+  parsed_times <- lubridate::parse_date_time(
+    time_vec, orders = c("HMS", "HM", "H"), quiet = TRUE
+  )
+  parsed_times[is.na(parsed_times)] <- as.POSIXct(
+    "00:00:00", format = "%H:%M:%S", tz = "America/New_York"
+  )
+  dt_strings <- paste(as.Date(parsed_dates), format(parsed_times, "%H:%M:%S"))
+  suppressWarnings(as.POSIXct(dt_strings, tz = "America/New_York"))
+}
+
+# ── Read and clean one file ────────────────────────────────────────────────
+safe_read <- function(path) {
+  df <- read.csv(path, stringsAsFactors = FALSE)
+
+  # Standardize column names
+  colnames(df) <- tolower(gsub("[[:space:]]+", "_", colnames(df)))
+
+  # Parse datetime
+  if ("cmplnt_fr_dt" %in% colnames(df)) {
+    if ("cmplnt_fr_tm" %in% colnames(df)) {
+      df$datetime <- safe_parse_datetime(df$cmplnt_fr_dt, df$cmplnt_fr_tm)
+    } else {
+      df$datetime <- safe_parse_datetime(df$cmplnt_fr_dt)
+    }
+  } else {
+    df$datetime <- as.POSIXct(NA)
+  }
+
+  # Parse complaint-to date
+  if ("cmplnt_to_dt" %in% colnames(df)) {
+    df$cmplnt_to_dt <- suppressWarnings(
+      lubridate::parse_date_time(
+        df$cmplnt_to_dt,
+        orders = c("mdy", "ymd", "dmy"),
+        tz     = "America/New_York",
+        quiet  = TRUE
+      )
+    )
+  }
+  df
+}
+
+# ── Prepare one cleaned dataframe ─────────────────────────────────────────
+prep_one <- function(df) {
+  # Drop missing datetime or borough
+  df <- df %>%
+    filter(!is.na(datetime), !is.na(boro_nm), boro_nm != "")
+
+  # Standardize borough names
+  df$boro_nm <- toupper(trimws(df$boro_nm))
+
+  # Clean categorical columns
+  cats <- c(
+    "ofns_desc", "law_cat_cd", "vic_race", "vic_sex",
+    "vic_age_group", "susp_race", "susp_sex", "susp_age_group",
+    "prem_typ_desc", "loc_of_occur_desc"
+  )
+  for (cn in cats) {
+    if (cn %in% names(df)) {
+      df[[cn]] <- toupper(trimws(df[[cn]]))
+      df[[cn]][df[[cn]] == "" | is.na(df[[cn]])] <- "NULL"
+    }
+  }
+
+  # Replace blanks/NAs in non-date columns
+  non_dt_cols <- names(df)[!sapply(df, inherits, "POSIXt")]
+  df[, non_dt_cols] <- lapply(df[, non_dt_cols], function(x) {
+    x[x == "" | is.na(x)] <- "NULL"
+    x
+  })
+
+  # Extract temporal features
+  df <- df %>%
+    mutate(
+      year        = lubridate::year(datetime),
+      month       = lubridate::month(datetime),
+      day         = lubridate::day(datetime),
+      hour        = lubridate::hour(datetime),
+      day_of_week = lubridate::wday(datetime, label = TRUE)
+    )
+
+  # Age group ordinal encoding (for nonparametric tests)
+  age_map <- c("<18" = 1, "18-24" = 2, "25-44" = 3,
+               "45-64" = 4, "65+" = 5, "UNKNOWN" = 0)
+  if ("vic_age_group" %in% names(df)) {
+    df$vic_age_group_code <- as.integer(age_map[df$vic_age_group])
+    df$vic_age_group_code[is.na(df$vic_age_group_code)] <- 0L
+  }
+  if ("susp_age_group" %in% names(df)) {
+    df$susp_age_group_code <- as.integer(age_map[df$susp_age_group])
+    df$susp_age_group_code[is.na(df$susp_age_group_code)] <- 0L
+  }
+
+  # Remove all-NULL columns
+  df <- df[, colSums(
+    df[, names(df)[!sapply(df, inherits, "POSIXt")]] != "NULL",
+    na.rm = TRUE
+  ) > 0]
+
+  df
+}
+
+# ── Extract htest summary ──────────────────────────────────────────────────
+extract_test <- function(test_name, result, interpretation) {
+  if (is.null(result) || !inherits(result, "htest")) {
+    return(data.frame(
+      Test        = test_name,
+      Statistic   = NA_real_,
+      P_Value     = NA_real_,
+      Decision    = "NA",
+      Interpretation = interpretation,
+      stringsAsFactors = FALSE
+    ))
+  }
+  p_val    <- result$p.value
+  decision <- ifelse(p_val < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0")
+  data.frame(
+    Test           = test_name,
+    Statistic      = round(as.numeric(result$statistic), 4),
+    P_Value        = round(p_val, 6),
+    Decision       = decision,
+    Interpretation = interpretation,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+---
+
+# Data Loading and Cleaning
+
+```{r load-data}
+cat("Loading and cleaning", length(paths), "files...\n")
+
+cleaned_list <- lapply(paths, function(path) {
+  cat("  Processing:", basename(path), "\n")
+  df <- safe_read(path)
+
+  # Re-parse datetime after character conversion
+  if ("datetime" %in% names(df)) {
+    df$datetime <- as.character(df$datetime)
+    invalid_rows <- which(
+      df$datetime == "" | df$datetime == "NULL" |
+      is.na(df$datetime) | grepl("[^0-9/: -]", df$datetime)
+    )
+    if (length(invalid_rows) > 0) df <- df[-invalid_rows, ]
+
+    df$datetime <- suppressWarnings(
+      lubridate::parse_date_time(
+        df$datetime,
+        orders = c("ymd HMS", "ymd HM", "ymd",
+                   "mdy HMS", "mdy HM", "mdy",
+                   "dmy HMS", "dmy HM", "dmy"),
+        tz     = "America/New_York",
+        exact  = FALSE,
+        quiet  = TRUE
+      )
+    )
+    df <- df[!is.na(df$datetime), ]
+  }
+  prep_one(df)
+})
+
+# Bind all cleaned parts into one dataframe
+df <- dplyr::bind_rows(cleaned_list)
+
+cat("\nTotal records after cleaning:", format(nrow(df), big.mark = ","), "\n")
+cat("Columns:", ncol(df), "\n")
+cat("Year range:", min(df$year, na.rm = TRUE), "–", max(df$year, na.rm = TRUE), "\n")
+cat("Boroughs:", paste(sort(unique(df$boro_nm)), collapse = ", "), "\n")
+```
+
+---
+
+# Save Cleaned Data
+
+```{r save-cleaned}
+clean_path <- file.path(output_dir, "assaults_thefts_cleaned.csv")
+write.csv(df, clean_path, row.names = FALSE)
+cat("Cleaned data saved to:", clean_path, "\n")
+cat("Rows:", format(nrow(df), big.mark = ","),
+    "| Columns:", ncol(df), "\n")
+```
+
+---
+
+# Exploratory Data Analysis
+
+```{r eda-borough}
+BOROUGH_COLORS <- c(
+  "MANHATTAN"     = "#4F46E5",
+  "BROOKLYN"      = "#EF4444",
+  "QUEENS"        = "#10B981",
+  "BRONX"         = "#F59E0B",
+  "STATEN ISLAND" = "#8B5CF6"
+)
+
+# Borough counts
+boro_cnt <- df %>%
+  count(boro_nm, name = "incidents") %>%
+  arrange(desc(incidents)) %>%
+  mutate(pct = round(incidents / sum(incidents) * 100, 1))
+
+kable(boro_cnt, caption = "Incident Counts by Borough",
+      col.names = c("Borough", "Incidents", "% of Total"))
+
+ggplot(boro_cnt, aes(x = reorder(boro_nm, incidents), y = incidents,
+                     fill = boro_nm)) +
+  geom_col(width = 0.7, show.legend = FALSE) +
+  geom_text(aes(label = paste0(format(incidents, big.mark = ","),
+                               " (", pct, "%)")),
+            hjust = -0.1, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = BOROUGH_COLORS) +
+  scale_y_continuous(labels = scales::comma,
+                     expand = expansion(mult = c(0, 0.20))) +
+  coord_flip() +
+  labs(
+    title    = "NYC Assaults & Thefts — Incident Count by Borough (2015–2024)",
+    subtitle = "Source: NYPD Complaint Data Historic | NYC Open Data",
+    x = "Borough", y = "Number of Incidents"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r eda-yearly}
+yr_boro <- df %>%
+  count(year, boro_nm, name = "count")
+
+ggplot(yr_boro, aes(x = year, y = count, color = boro_nm, group = boro_nm)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = 2019, linetype = "dashed",
+             color = "black", linewidth = 0.8, alpha = 0.7) +
+  annotate("text", x = 2019.2, y = max(yr_boro$count) * 0.95,
+           label = "2019 Policy", hjust = 0, size = 3.5) +
+  scale_color_manual(values = BOROUGH_COLORS, name = "Borough") +
+  scale_x_continuous(breaks = 2015:2024) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Yearly Trend of Assaults & Thefts by Borough",
+    subtitle = "Wilcoxon Signed Rank: Pre vs Post intervention analysis",
+    x = "Year", y = "Incident Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "right")
+```
+
+```{r eda-offense}
+top_offenses <- df %>%
+  filter(ofns_desc != "NULL") %>%
+  count(ofns_desc, name = "n") %>%
+  slice_max(n, n = 10)
+
+ggplot(top_offenses, aes(x = reorder(ofns_desc, n), y = n)) +
+  geom_col(fill = "#4F46E5", width = 0.7) +
+  geom_text(aes(label = format(n, big.mark = ",")),
+            hjust = -0.1, size = 3.2) +
+  scale_y_continuous(labels = scales::comma,
+                     expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title = "Top 10 Offense Types — Assaults & Thefts",
+    x = "Offense Description", y = "Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r eda-age-heatmap}
+# Victim vs Suspect age cross-tabulation
+age_cross <- df %>%
+  filter(vic_age_group != "NULL", susp_age_group != "NULL") %>%
+  count(vic_age_group, susp_age_group, name = "n")
+
+ggplot(age_cross, aes(x = susp_age_group, y = vic_age_group, fill = n)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = format(n, big.mark = ",")), size = 3) +
+  scale_fill_gradient(low = "#EEF2FF", high = "#4F46E5",
+                      labels = scales::comma, name = "Count") +
+  labs(
+    title    = "Victim vs Suspect Age Group Cross-Tabulation",
+    subtitle = "Spearman Correlation Matrix: Age group associations",
+    x = "Suspect Age Group", y = "Victim Age Group"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r eda-monthly}
+mo_boro <- df %>%
+  count(month, boro_nm, name = "n")
+
+ggplot(mo_boro, aes(x = factor(month), y = n, fill = boro_nm)) +
+  geom_col(position = "dodge", width = 0.8) +
+  scale_fill_manual(values = BOROUGH_COLORS, name = "Borough") +
+  scale_x_discrete(labels = month.abb) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Monthly Seasonality of Assaults & Thefts by Borough",
+    subtitle = "Kruskal-Wallis: Significant monthly variation within boroughs",
+    x = "Month", y = "Incident Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+```
+
+---
+
+# Nonparametric Tests
+
+## Aggregate daily counts by borough (used in multiple tests)
+
+```{r agg-daily}
+by_day_boro <- df %>%
+  filter(!is.na(boro_nm), boro_nm != "NULL") %>%
+  mutate(date = as.Date(datetime)) %>%
+  count(boro_nm, date, name = "n")
+
+cat("Daily borough counts shape:", nrow(by_day_boro),
+    "rows ×", ncol(by_day_boro), "cols\n")
+```
+
+## Test 1 — Sign Test (ADDR_PCT_CD vs hypothetical median = 100)
+
+**H₀:** Median of ADDR_PCT_CD equals 100
+**H₁:** Median of ADDR_PCT_CD ≠ 100
+
+```{r test1-sign}
+pct_vals    <- na.omit(as.numeric(df$addr_pct_cd))
+hyp_med     <- 100
+signs_pos   <- sum(pct_vals > hyp_med)
+signs_neg   <- sum(pct_vals < hyp_med)
+n_sign      <- signs_pos + signs_neg
+t1_stat     <- min(signs_pos, signs_neg)
+t1_p        <- 2 * pbinom(t1_stat, size = n_sign, prob = 0.5)
+
+cat("Sign Test — ADDR_PCT_CD vs median =", hyp_med, "\n")
+cat("  Positive signs:", signs_pos, "\n")
+cat("  Negative signs:", signs_neg, "\n")
+cat("  Test statistic (min):", t1_stat, "\n")
+cat("  P-value:", formatC(t1_p, format = "e", digits = 4), "\n")
+cat("  Decision:", ifelse(t1_p < 0.05, "Reject H0", "Fail to Reject H0"), "\n")
+
+test1_result <- data.frame(
+  Test = "Sign Test (ADDR_PCT_CD vs median=100)",
+  Statistic = t1_stat, P_Value = t1_p,
+  Decision = ifelse(t1_p < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0"),
+  Interpretation = paste(
+    "Median of precinct codes",
+    ifelse(t1_p < 0.05,
+           "significantly differs from 100 — borough-based precinct structure confirmed.",
+           "does not significantly differ from 100.")
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+## Test 2 — Wilcoxon Signed Rank 1-sample (KY_CD vs its median)
+
+**H₀:** Median of KY_CD equals its sample median
+**H₁:** Distribution of KY_CD is asymmetric around the median
+
+```{r test2-wilcoxon-1sample}
+ky_vals <- na.omit(as.numeric(df$ky_cd))
+t2 <- wilcox.test(ky_vals, mu = median(ky_vals), alternative = "two.sided")
+
+cat("Wilcoxon Signed Rank 1-sample — KY_CD\n")
+print(t2)
+
+test2_result <- extract_test(
+  "Wilcoxon Signed Rank 1-sample (KY_CD)",
+  t2,
+  paste("Offense code distribution",
+        ifelse(t2$p.value < 0.05,
+               "is significantly asymmetric — offense type clustering exists.",
+               "does not significantly deviate from its median."))
+)
+```
+
+## Test 3 — Mann-Whitney U (Manhattan vs Brooklyn — ADDR_PCT_CD)
+
+**H₀:** ADDR_PCT_CD has the same distribution in Manhattan and Brooklyn
+**H₁:** Distributions differ
+
+```{r test3-mannwhitney}
+mnh_pct <- na.omit(as.numeric(df$addr_pct_cd[df$boro_nm == "MANHATTAN"]))
+bkn_pct <- na.omit(as.numeric(df$addr_pct_cd[df$boro_nm == "BROOKLYN"]))
+
+t3 <- wilcox.test(mnh_pct, bkn_pct, alternative = "two.sided", correct = TRUE)
+
+cat("Mann-Whitney U — ADDR_PCT_CD: Manhattan vs Brooklyn\n")
+print(t3)
+
+# Visualize
+pct_plot_df <- df %>%
+  filter(boro_nm %in% c("MANHATTAN", "BROOKLYN"),
+         !is.na(addr_pct_cd), addr_pct_cd != "NULL") %>%
+  mutate(addr_pct_cd = as.numeric(addr_pct_cd))
+
+ggplot(pct_plot_df, aes(x = addr_pct_cd, fill = boro_nm)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity", color = "white") +
+  scale_fill_manual(values = c("MANHATTAN" = "#4F46E5", "BROOKLYN" = "#EF4444"),
+                    name = "Borough") +
+  labs(
+    title    = "ADDR_PCT_CD Distribution: Manhattan vs Brooklyn",
+    subtitle = paste("Mann-Whitney U: W =", round(t3$statistic, 0),
+                     "| p-value =", formatC(t3$p.value, format = "e", digits = 3)),
+    x = "Precinct Code", y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test3_result <- extract_test(
+  "Mann-Whitney U (ADDR_PCT_CD: Manhattan vs Brooklyn)",
+  t3,
+  "Precinct code distributions differ significantly between the two boroughs."
+)
+```
+
+## Test 4 — Kruskal-Wallis (ADDR_PCT_CD across all 5 boroughs)
+
+**H₀:** ADDR_PCT_CD distributions are the same across all boroughs
+**H₁:** At least one borough differs
+
+```{r test4-kruskal-wallis}
+pct_groups <- lapply(
+  c("MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND"),
+  function(b) na.omit(as.numeric(df$addr_pct_cd[df$boro_nm == b]))
+)
+names(pct_groups) <- c("MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND")
+
+t4 <- kruskal.test(
+  as.numeric(addr_pct_cd) ~ boro_nm,
+  data = df %>% filter(boro_nm %in% names(pct_groups),
+                       !is.na(addr_pct_cd), addr_pct_cd != "NULL") %>%
+    mutate(addr_pct_cd = as.numeric(addr_pct_cd))
+)
+
+cat("Kruskal-Wallis — ADDR_PCT_CD across 5 boroughs\n")
+print(t4)
+
+test4_result <- extract_test(
+  "Kruskal-Wallis (ADDR_PCT_CD across 5 boroughs)",
+  t4,
+  paste("Precinct code distributions",
+        ifelse(t4$p.value < 0.05,
+               "differ significantly across boroughs — geographic crime concentration confirmed.",
+               "do not differ significantly across boroughs."))
+)
+```
+
+## Test 5 — Kolmogorov-Smirnov (Manhattan vs Queens — ADDR_PCT_CD)
+
+**H₀:** ADDR_PCT_CD has the same distribution in Manhattan and Queens
+**H₁:** Distributions have different shapes
+
+```{r test5-ks}
+qns_pct <- na.omit(as.numeric(df$addr_pct_cd[df$boro_nm == "QUEENS"]))
+
+t5 <- ks.test(mnh_pct, qns_pct)
+
+cat("Kolmogorov-Smirnov — ADDR_PCT_CD: Manhattan vs Queens\n")
+print(t5)
+
+# ECDF plot
+ks_df <- data.frame(
+  pct   = c(mnh_pct, qns_pct),
+  boro  = c(rep("MANHATTAN", length(mnh_pct)),
+            rep("QUEENS",    length(qns_pct)))
+)
+ggplot(ks_df, aes(x = pct, color = boro)) +
+  stat_ecdf(linewidth = 1.2) +
+  scale_color_manual(values = c("MANHATTAN" = "#4F46E5", "QUEENS" = "#10B981"),
+                     name = "Borough") +
+  labs(
+    title    = "ECDF: ADDR_PCT_CD — Manhattan vs Queens (KS Test)",
+    subtitle = paste("KS D =", round(t5$statistic, 4),
+                     "| p-value =", formatC(t5$p.value, format = "e", digits = 3)),
+    x = "Precinct Code", y = "Cumulative Probability"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test5_result <- extract_test(
+  "KS Test (ADDR_PCT_CD: Manhattan vs Queens)",
+  t5,
+  "Distribution shapes of precinct codes differ significantly between boroughs."
+)
+```
+
+## Test 6 — Spearman Correlation (ADDR_PCT_CD vs KY_CD)
+
+**H₀:** No monotonic association between precinct code and offense code
+**H₁:** Significant monotonic association exists
+
+```{r test6-spearman}
+spear_df <- df %>%
+  filter(!is.na(addr_pct_cd), addr_pct_cd != "NULL",
+         !is.na(ky_cd),       ky_cd != "NULL") %>%
+  mutate(addr_pct_cd = as.numeric(addr_pct_cd),
+         ky_cd       = as.numeric(ky_cd)) %>%
+  filter(!is.na(addr_pct_cd), !is.na(ky_cd))
+
+t6 <- cor.test(spear_df$addr_pct_cd, spear_df$ky_cd,
+               method = "spearman", exact = FALSE)
+
+cat("Spearman Correlation — ADDR_PCT_CD vs KY_CD\n")
+print(t6)
+
+ggplot(spear_df %>% sample_n(min(5000, nrow(.))),
+       aes(x = addr_pct_cd, y = ky_cd)) +
+  geom_point(alpha = 0.2, color = "#4F46E5", size = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "#EF4444",
+              linewidth = 1.2) +
+  labs(
+    title    = "Spearman Correlation: ADDR_PCT_CD vs KY_CD",
+    subtitle = paste("ρ =", round(t6$estimate, 4),
+                     "| p-value =", formatC(t6$p.value, format = "e", digits = 3)),
+    x = "Precinct Code (ADDR_PCT_CD)", y = "Offense Code (KY_CD)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test6_result <- extract_test(
+  "Spearman Correlation (ADDR_PCT_CD vs KY_CD)",
+  t6,
+  paste("Monotonic association ρ =", round(t6$estimate, 3),
+        "between precinct and offense code.")
+)
+```
+
+## Test 7 — Spearman Correlation Matrix (Victim vs Suspect Age Groups)
+
+**H₀:** No rank association between victim and suspect age group codes
+**H₁:** Significant rank association exists
+
+```{r test7-spearman-matrix}
+age_df <- df %>%
+  filter(vic_age_group_code > 0, susp_age_group_code > 0)
+
+t7 <- cor.test(age_df$vic_age_group_code, age_df$susp_age_group_code,
+               method = "spearman", exact = FALSE)
+
+cat("Spearman Correlation — Victim Age Code vs Suspect Age Code\n")
+print(t7)
+
+# Correlation matrix of all numeric variables
+num_vars <- c("addr_pct_cd", "ky_cd", "vic_age_group_code", "susp_age_group_code")
+cor_data <- df %>%
+  mutate(across(all_of(c("addr_pct_cd", "ky_cd")), as.numeric)) %>%
+  select(all_of(num_vars)) %>%
+  filter(complete.cases(.)) %>%
+  filter(vic_age_group_code > 0, susp_age_group_code > 0)
+
+cor_matrix <- cor(cor_data, method = "spearman", use = "complete.obs")
+
+cat("\nSpearman Correlation Matrix:\n")
+print(round(cor_matrix, 4))
+
+test7_result <- extract_test(
+  "Spearman Correlation Matrix (Victim vs Suspect Age Group)",
+  t7,
+  paste("Rank association ρ =", round(t7$estimate, 3),
+        "between victim and suspect age groups.")
+)
+```
+
+## Test 8 — Permutation Test (Mean KY_CD: Manhattan vs Brooklyn)
+
+**H₀:** Mean KY_CD is the same in Manhattan and Brooklyn
+**H₁:** Observed difference in means is significant under randomization
+
+```{r test8-permutation}
+set.seed(42)
+N_PERM <- 2000
+
+ky_mnh <- na.omit(as.numeric(df$ky_cd[df$boro_nm == "MANHATTAN"]))
+ky_bkn <- na.omit(as.numeric(df$ky_cd[df$boro_nm == "BROOKLYN"]))
+
+obs_diff_mean <- abs(mean(ky_mnh) - mean(ky_bkn))
+combined_ky   <- c(ky_mnh, ky_bkn)
+n_mnh         <- length(ky_mnh)
+
+perm_diffs <- replicate(N_PERM, {
+  shuffled <- sample(combined_ky)
+  abs(mean(shuffled[1:n_mnh]) - mean(shuffled[(n_mnh + 1):length(shuffled)]))
+})
+
+t8_p <- mean(perm_diffs >= obs_diff_mean)
+
+cat("Permutation Test — Mean KY_CD: Manhattan vs Brooklyn\n")
+cat("  Observed |diff|:", round(obs_diff_mean, 4), "\n")
+cat("  Permutations:", N_PERM, "\n")
+cat("  P-value:", round(t8_p, 4), "\n")
+cat("  Decision:", ifelse(t8_p < 0.05, "Reject H0", "Fail to Reject H0"), "\n")
+
+# Null distribution plot
+perm_df <- data.frame(diff = perm_diffs)
+ggplot(perm_df, aes(x = diff)) +
+  geom_histogram(bins = 40, fill = "#EEF2FF", color = "#4F46E5",
+                 linewidth = 0.4) +
+  geom_vline(xintercept = obs_diff_mean,
+             color = "#EF4444", linewidth = 1.5, linetype = "dashed") +
+  annotate("text", x = obs_diff_mean * 1.05,
+           y = max(table(cut(perm_diffs, 40))) * 0.9,
+           label = paste("Observed =", round(obs_diff_mean, 2)),
+           color = "#EF4444", hjust = 0, size = 3.5) +
+  labs(
+    title    = "Permutation Test Null Distribution — Mean KY_CD",
+    subtitle = paste("Manhattan vs Brooklyn |",
+                     "p-value =", round(t8_p, 4),
+                     "| N =", N_PERM, "permutations"),
+    x = "Permuted |Mean Difference|", y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+test8_result <- data.frame(
+  Test = "Permutation Test (Mean KY_CD: Manhattan vs Brooklyn)",
+  Statistic = round(obs_diff_mean, 4),
+  P_Value   = round(t8_p, 4),
+  Decision  = ifelse(t8_p < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0"),
+  Interpretation = paste(
+    "Observed mean difference of", round(obs_diff_mean, 2),
+    "in offense codes between boroughs is",
+    ifelse(t8_p < 0.05, "statistically significant.", "not statistically significant.")
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+## Test 9 — Sign + Wilcoxon + Kruskal-Wallis (Victim vs Suspect Age Groups)
+
+**Research Question:** Do suspect and victim age groups differ significantly?
+
+```{r test9-combined-age}
+age_paired <- df %>%
+  filter(vic_age_group_code > 0, susp_age_group_code > 0) %>%
+  select(vic_age_group_code, susp_age_group_code)
+
+age_diff <- age_paired$vic_age_group_code - age_paired$susp_age_group_code
+
+# Sign Test
+n_nonzero  <- sum(age_diff != 0)
+n_pos      <- sum(age_diff > 0)
+n_neg      <- sum(age_diff < 0)
+t9_sign_stat <- min(n_pos, n_neg)
+t9_sign_p    <- 2 * pbinom(t9_sign_stat, n_nonzero, 0.5)
+
+# Wilcoxon Signed Rank
+t9_wilcox <- wilcox.test(age_paired$vic_age_group_code,
+                          age_paired$susp_age_group_code,
+                          paired = TRUE, alternative = "two.sided",
+                          exact = FALSE)
+
+# Kruskal-Wallis — both age codes across boroughs
+age_long <- df %>%
+  filter(vic_age_group_code > 0, boro_nm != "NULL") %>%
+  select(boro_nm, vic_age_group_code)
+t9_kw <- kruskal.test(vic_age_group_code ~ boro_nm, data = age_long)
+
+cat("Test 9 — Age Group Analysis\n")
+cat("  Sign Test: stat =", t9_sign_stat, "| p =",
+    formatC(t9_sign_p, format = "e", digits = 4), "\n")
+cat("  Wilcoxon Signed Rank:", "\n"); print(t9_wilcox)
+cat("  Kruskal-Wallis (vic_age across boroughs):\n"); print(t9_kw)
+
+test9_result <- data.frame(
+  Test = "Sign + Wilcoxon + KW (Victim vs Suspect Age Groups)",
+  Statistic = t9_sign_stat,
+  P_Value   = min(t9_sign_p, t9_wilcox$p.value, t9_kw$p.value),
+  Decision  = ifelse(t9_sign_p < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0"),
+  Interpretation = paste(
+    "Victim and suspect age group distributions",
+    ifelse(t9_sign_p < 0.05, "differ significantly (Sign p < 0.05).",
+           "do not significantly differ.")
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+## Test 10 — Mann-Whitney + KW + KS (KY_CD across Bronx vs Queens)
+
+```{r test10-multi}
+bronx_ky <- na.omit(as.numeric(df$ky_cd[df$boro_nm == "BRONX"]))
+qns_ky   <- na.omit(as.numeric(df$ky_cd[df$boro_nm == "QUEENS"]))
+
+t10_mw <- wilcox.test(bronx_ky, qns_ky, alternative = "two.sided")
+t10_ks <- ks.test(bronx_ky, qns_ky)
+
+ky_all <- df %>%
+  filter(boro_nm != "NULL", !is.na(ky_cd), ky_cd != "NULL") %>%
+  mutate(ky_cd = as.numeric(ky_cd)) %>%
+  filter(!is.na(ky_cd))
+t10_kw <- kruskal.test(ky_cd ~ boro_nm, data = ky_all)
+
+cat("Test 10 — KY_CD: Bronx vs Queens\n")
+cat("  Mann-Whitney U:\n"); print(t10_mw)
+cat("  KS Test:\n");        print(t10_ks)
+cat("  Kruskal-Wallis (all boroughs):\n"); print(t10_kw)
+
+test10_result <- data.frame(
+  Test = "Mann-Whitney + KW + KS (KY_CD: Bronx vs Queens)",
+  Statistic = round(as.numeric(t10_mw$statistic), 4),
+  P_Value   = round(t10_mw$p.value, 6),
+  Decision  = ifelse(t10_mw$p.value < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0"),
+  Interpretation = paste(
+    "Offense type (KY_CD) distributions",
+    ifelse(t10_mw$p.value < 0.05,
+           "differ significantly between Bronx and Queens.",
+           "do not significantly differ between Bronx and Queens.")
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+## Test 11 — Spearman + KS (Borough Code vs Offense Severity KY_CD)
+
+```{r test11-spearman-ks}
+boro_enc <- c("MANHATTAN" = 1, "BROOKLYN" = 2, "QUEENS" = 3,
+              "BRONX" = 4, "STATEN ISLAND" = 5)
+bks_df <- df %>%
+  filter(boro_nm %in% names(boro_enc), !is.na(ky_cd), ky_cd != "NULL") %>%
+  mutate(boro_code = boro_enc[boro_nm],
+         ky_cd     = as.numeric(ky_cd)) %>%
+  filter(!is.na(ky_cd))
+
+t11_sp <- cor.test(bks_df$boro_code, bks_df$ky_cd,
+                   method = "spearman", exact = FALSE)
+
+# KS: Manhattan vs Bronx on KY_CD
+mnh_ky_ks <- na.omit(as.numeric(df$ky_cd[df$boro_nm == "MANHATTAN"]))
+bnx_ky_ks <- na.omit(as.numeric(df$ky_cd[df$boro_nm == "BRONX"]))
+t11_ks    <- ks.test(mnh_ky_ks, bnx_ky_ks)
+
+cat("Test 11 — Borough Code vs Offense KY_CD\n")
+cat("  Spearman:\n"); print(t11_sp)
+cat("  KS (Manhattan vs Bronx):\n"); print(t11_ks)
+
+test11_result <- extract_test(
+  "Spearman + KS (Borough Code vs Offense KY_CD)",
+  t11_sp,
+  paste("Borough predicts offense severity with ρ =",
+        round(t11_sp$estimate, 3))
+)
+```
+
+## Test 12 — Permutation Test (Median ADDR_PCT_CD: Manhattan vs Brooklyn)
+
+**H₀:** Median ADDR_PCT_CD is equal in Manhattan and Brooklyn under resampling
+
+```{r test12-permutation-median}
+set.seed(42)
+N_PERM2 <- 2000
+
+obs_diff_med <- abs(median(mnh_pct) - median(bkn_pct))
+combined_pct <- c(mnh_pct, bkn_pct)
+n_mnh2       <- length(mnh_pct)
+
+perm_meds <- replicate(N_PERM2, {
+  s <- sample(combined_pct)
+  abs(median(s[1:n_mnh2]) - median(s[(n_mnh2 + 1):length(s)]))
+})
+
+t12_p <- mean(perm_meds >= obs_diff_med)
+
+cat("Permutation Test — Median ADDR_PCT_CD: Manhattan vs Brooklyn\n")
+cat("  Observed |median diff|:", obs_diff_med, "\n")
+cat("  P-value:", round(t12_p, 4), "\n")
+cat("  Decision:", ifelse(t12_p < 0.05, "Reject H0", "Fail to Reject H0"), "\n")
+
+test12_result <- data.frame(
+  Test = "Permutation Test (Median ADDR_PCT_CD: Manhattan vs Brooklyn)",
+  Statistic = obs_diff_med,
+  P_Value   = round(t12_p, 4),
+  Decision  = ifelse(t12_p < 0.05, "Reject H0 (p<0.05)", "Fail to Reject H0"),
+  Interpretation = paste(
+    "Resampling confirms: precinct code medians",
+    ifelse(t12_p < 0.05,
+           "differ significantly between Manhattan and Brooklyn.",
+           "do not significantly differ between boroughs.")
+  ),
+  stringsAsFactors = FALSE
+)
+```
+
+---
+
+# Summary of All 12 Test Results
+
+```{r results-summary}
+all_results <- dplyr::bind_rows(
+  test1_result,  test2_result,  test3_result,  test4_result,
+  test5_result,  test6_result,  test7_result,  test8_result,
+  test9_result,  test10_result, test11_result, test12_result
+)
+
+all_results$Test_Num <- 1:12
+all_results <- all_results[, c("Test_Num", "Test", "Statistic",
+                                "P_Value", "Decision", "Interpretation")]
+
+kable(all_results,
+      caption = "Assaults & Thefts — All 12 Nonparametric Test Results",
+      col.names = c("#", "Test Name", "Statistic", "P-Value",
+                    "Decision (α=0.05)", "Interpretation"))
+
+# Count significant results
+n_sig   <- sum(grepl("Reject", all_results$Decision) &
+               !grepl("Fail", all_results$Decision))
+n_total <- nrow(all_results)
+cat("\nSignificant results:", n_sig, "of", n_total,
+    "(", round(n_sig / n_total * 100, 1), "% )\n")
+
+# Summary bar chart
+sig_df <- all_results %>%
+  mutate(
+    Significant = ifelse(grepl("Reject", Decision) & !grepl("Fail", Decision),
+                         "Significant (Reject H0)",
+                         "Not Significant (Fail to Reject)")
+  )
+ggplot(sig_df, aes(x = factor(Test_Num), y = 1, fill = Significant)) +
+  geom_col(width = 0.6) +
+  scale_fill_manual(
+    values = c("Significant (Reject H0)"  = "#10B981",
+               "Not Significant (Fail to Reject)" = "#EF4444"),
+    name = "Result"
+  ) +
+  labs(
+    title    = "Assaults & Thefts — Nonparametric Test Results (12 Tests)",
+    subtitle = paste(n_sig, "of", n_total, "tests significant at α = 0.05"),
+    x = "Test Number", y = ""
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title   = element_text(face = "bold"),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid   = element_blank(),
+    legend.position = "top"
+  )
+
+# Save results
+results_path <- file.path(output_dir, "Assaults_Thefts_Test_Results.csv")
+write.csv(all_results, results_path, row.names = FALSE)
+cat("Results saved to:", results_path, "\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

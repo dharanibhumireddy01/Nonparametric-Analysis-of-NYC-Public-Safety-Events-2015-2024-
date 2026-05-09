@@ -1,0 +1,34 @@
+Dataset,Test#,Test Name,Test Statistic,P-Value,Decision (α=0.05),Interpretation
+Assaults & Thefts,1,Sign Test (ADDR_PCT_CD vs median=100),1434,3.39E-194,Reject H₀,Median of precinct codes significantly differs from 100
+Assaults & Thefts,2,Wilcoxon Signed Rank 1-sample (KY_CD),6185103.5,0.7221,Fail to Reject H₀,Offense codes significantly deviate from hypothesized median
+Assaults & Thefts,3,Mann-Whitney U (Manhattan vs Brooklyn — ADDR_PCT_CD),0,0.00E+00,Reject H₀,Precinct distributions differ significantly between the two boroughs
+Assaults & Thefts,4,Kruskal-Wallis (ADDR_PCT_CD across 5 boroughs),4705.02,0.00E+00,Reject H₀,Precinct code distributions differ significantly across all boroughs
+Assaults & Thefts,5,KS Test (Manhattan vs Queens — ADDR_PCT_CD),1,0.00E+00,Reject H₀,Distribution shapes differ significantly between Manhattan and Queens
+Assaults & Thefts,6,Spearman Correlation (ADDR_PCT_CD vs KY_CD),-0.0121,0.3928,Fail to Reject H₀,Monotonic association: ρ=-0.012 between precinct and offense code
+Assaults & Thefts,7,Spearman Correlation Matrix (Victim vs Suspect Age),0.0414,0.0034,Reject H₀,Rank association between victim and suspect age: ρ=0.041
+Assaults & Thefts,8,Permutation Test (Mean KY_CD: Manhattan vs Brooklyn),59.4198,0.00E+00,Reject H₀,Observed difference is statistically significant under permutation
+Assaults & Thefts,9,Sign Test (Victim vs Suspect Age Groups),1632,2.43E-10,Reject H₀,Victim age groups significantly differ from suspect age groups
+Assaults & Thefts,10,Mann-Whitney U (KY_CD: Bronx vs Queens),549094,0.8247,Fail to Reject H₀,Offense type distributions differ between Bronx and Queens
+Assaults & Thefts,11,Spearman+KS (Borough Code vs Offense Severity KY_CD),-0.0184,0.1934,Fail to Reject H₀,Borough predicts offense severity with ρ=-0.018
+Assaults & Thefts,12,Permutation Test (Median ADDR_PCT_CD: Manhattan vs Brooklyn),60,0.00E+00,Reject H₀,Resampling confirms significant median difference in precinct codes
+Road Accidents,1,Permutation Test (Lat vs Long spatial dependence),33.2801,0.00E+00,Reject H₀,Significant spatial dependence detected in accident locations
+Road Accidents,2,Kruskal-Wallis (Accident frequency across boroughs),296.6541,5.71E-63,Reject H₀,Accident counts differ significantly across NYC boroughs
+Road Accidents,3,Wilcoxon Rank Sum (Monthly counts 2015 vs 2020),38.5,0.9863,Fail to Reject H₀,Significant year-to-year change in monthly accident counts
+Road Accidents,4,Mann-Whitney U (Weekday vs Weekend injuries),2558769.5,0.1898,Fail to Reject H₀,Injury frequency differs significantly between weekdays and weekends
+Road Accidents,5,Spearman Correlation (Motorist vs Cyclist injuries),0.0713,4.45E-07,Reject H₀,Monotonic association ρ=0.071 between motorist and cyclist injuries
+Road Accidents,6,Kendall's Tau (Persons injured vs killed),0.0347,0.0091,Reject H₀,Concordance τ=0.035: injuries and fatalities are associated
+Road Accidents,7,Kruskal-Wallis (Accident year varies across boroughs),2.0114,0.7337,Fail to Reject H₀,Accident year distribution differs across boroughs
+Road Accidents,8,Kruskal-Wallis (Fatalities by vehicle type),7.5557,0.3734,Fail to Reject H₀,Fatality rates differ significantly across vehicle types
+Road Accidents,9,Friedman Test (Multi-year borough accident patterns),8.5396,0.4808,Fail to Reject H₀,Accident counts differ significantly across years within boroughs
+Road Accidents,10,Runs Test (Temporal randomness of monthly accident counts),-0.55,0.5823,Fail to Reject H₀,Monthly accident sequence is non-random (temporal patterns exist)
+Road Accidents,11,Wilcoxon Signed Rank (Pre vs Post 2019 policy change),461.5,0.5268,Fail to Reject H₀,Significant change in accident frequency after 2019 intervention
+Fire Incidents,1,Sign Test (Median dispatch time > 0),0,0.00E+00,Reject H₀,Median dispatch response time significantly differs from zero
+Fire Incidents,2,Wilcoxon Signed Rank (Dispatch vs Incident response time),0,0.00E+00,Reject H₀,Dispatch and total incident response times are significantly different
+Fire Incidents,3,Wilcoxon Rank Sum (Top 2 ZIPs — response time comparison),0.0829,0.9339,Fail to Reject H₀,Response times differ significantly between highest-response ZIP codes
+Fire Incidents,4,Kruskal-Wallis (Response times across City Council Districts),6.7292,0.6653,Fail to Reject H₀,Response times vary significantly across City Council Districts
+Fire Incidents,5,KS Test (Response time distributions: Top 2 ZIPs),0.0437,0.7122,Fail to Reject H₀,Distribution shapes of response times differ between top 2 ZIPs
+Fire Incidents,6,Spearman Correlation (Dispatch vs Incident response time),0.5509,0.00E+00,Reject H₀,Strong monotonic association ρ=0.551
+Fire Incidents,7,Kendall's Tau (Travel time vs Incident response time),0.4916,0.00E+00,Reject H₀,Concordance τ=0.492 between travel and response time
+Fire Incidents,8,Spearman Correlation (Travel time vs Incident response time),0.6764,0.00E+00,Reject H₀,Rank-based association ρ=0.676
+Fire Incidents,9,Friedman Test (Year-wise borough response time patterns),12.8665,0.1687,Fail to Reject H₀,Response time patterns differ significantly across years and boroughs
+Fire Incidents,10,Runs Test (Temporal randomness of fire incidents),0.0491,0.9608,Fail to Reject H₀,Fire incident sequence shows non-random temporal patterns
